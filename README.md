@@ -1,4 +1,4 @@
-# Skapi Python
+# Skapi for Python
 
 The [Skapi](https://www.skapi.com) backend for Python: sign users in, keep their sessions, and read and write your project's database.
 
