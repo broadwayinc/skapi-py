@@ -1,6 +1,6 @@
 # skapi
 
-The [Skapi](https://www.skapi.com) backend for Python: sign users in, keep their sessions, and read and write your project's database. Same API as [skapi-js](https://www.npmjs.com/package/skapi-js), in Python style.
+The [Skapi](https://www.skapi.com) backend for Python: sign users in, keep their sessions, and read and write your project's database.
 
 ```
 pip install skapi
@@ -23,3 +23,5 @@ posts = skapi.get_records({"table": {"name": "posts", "access_group": "public"}}
 - Optional encryption of private records before upload, compatible with skapi-js: `pip install "skapi[encryption]"`.
 
 Documentation: https://py.skapi.com
+
+PyPi: https://pypi.org/project/skapi/
