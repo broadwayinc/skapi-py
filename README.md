@@ -22,4 +22,4 @@ posts = skapi.get_records({"table": {"name": "posts", "access_group": "public"}}
 - Realtime messages between users, in groups or one to one.
 - Optional encryption of private records before upload, compatible with skapi-js: `pip install "skapi[encryption]"`.
 
-Documentation: https://docs.skapi.com
+Documentation: https://py.skapi.com
