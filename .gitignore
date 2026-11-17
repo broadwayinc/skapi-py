@@ -1,2 +1,22 @@
+# Python bytecode
 __pycache__/
+*.py[cod]
 
+# Build and packaging output (python3 -m build)
+dist/
+build/
+*.egg-info/
+
+# Virtual environments and tool caches
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets, editors, OS
+.env
+.pypirc
+.DS_Store
+.vscode/
+.idea/
