@@ -1,0 +1,373 @@
+"""
+The request layer: endpoint discovery, headers, body encoding, errors, rate-limit retries and
+paging, matching skapi-js (src/utils/network.ts) so the server sees the same requests.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import random
+import re
+import threading
+import time
+import urllib.error
+import urllib.request
+from email.utils import parsedate_to_datetime
+from typing import Any, Dict, Optional
+from urllib.parse import quote
+
+from .errors import SkapiError
+
+DEFAULT_TARGET_CDN = "d3e9syvbtso631"
+ENDPOINT_VERSION = "v2"
+KNOWN_ERROR_CODES = ["INVALID_CORS", "INVALID_REQUEST", "SERVICE_DISABLED", "INVALID_PARAMETER", "ERROR", "EXISTS", "NOT_EXISTS"]
+RATE_LIMIT_MAX_RETRIES = 6
+
+ADMIN_ROUND_ROBIN = {
+    "get-newsletters", "get-public-newsletters", "subscribe-newsletter", "subscribe-public-newsletter",
+    "signupkey", "admin-newsletter-request", "admin-signup", "confirm-signup", "openid-logger",
+    "block-account", "admin-edit-profile", "remove-account", "recover-account", "mock",
+    "grant-access", "last-verified-email", "ticket", "register-ticket", "get-newsletter-subscription",
+    "send-inquiry", "register-newsletter-group", "delete-newsletter-group", "newsletter-group-endpoint",
+    "invitation-list", "csr", "csr-poll", "csr-cancel", "csr-finalize",
+}
+RECORD_ROUND_ROBIN = {
+    "store-subscription", "get-vapid-public-key", "push-notification", "delete-subscription",
+    "subscription", "get-subscription", "get-table", "get-tag", "get-uniqueid", "get-index",
+    "get-signed-url", "get-signed-urls", "extract-file-text", "grid-query", "anonymous-login",
+    "anonymous-session", "grant-private-access", "request-private-access-key", "get-ws-group",
+    "check-schema", "get-feed", "castspell", "dopamine", "getspell",
+}
+
+_counter_lock = threading.Lock()
+_request_counter = 0  # one counter for admin and record picks, as in skapi-js
+
+
+def _next_counter() -> int:
+    global _request_counter
+    with _counter_lock:
+        _request_counter += 1
+        return _request_counter
+
+
+def _js_value(v: Any) -> Any:
+    """What JSON.stringify writes: an integral float as an integer, NaN and Infinity as null."""
+    if isinstance(v, bool) or v is None:
+        return v
+    if isinstance(v, float):
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return int(v) if v.is_integer() and abs(v) < 2 ** 53 else v
+    if isinstance(v, dict):
+        return {str(k): _js_value(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_js_value(x) for x in v]
+    return v
+
+
+def js_json(v: Any) -> str:
+    """JSON.stringify: compact, insertion order kept, non-ASCII left as is."""
+    return json.dumps(_js_value(v), separators=(",", ":"), ensure_ascii=False)
+
+
+def encode_uri_component(text: str) -> str:
+    return quote(text, safe="-_.!~*'()")
+
+
+def _sorted_keys(v: Any) -> Any:
+    if isinstance(v, dict):
+        return {k: _sorted_keys(v[k]) for k in sorted(v)}
+    if isinstance(v, list):
+        return [_sorted_keys(x) for x in v]
+    return v
+
+
+def _md5(text: str) -> str:
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _retry_delay_ms(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value) * 1000)
+    except ValueError:
+        pass
+    try:
+        return max(0.0, parsedate_to_datetime(value).timestamp() * 1000 - time.time() * 1000)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rate_limit_wait_ms(delay: float, attempt: int) -> float:
+    base = delay if delay > 0 else min(60000, 500 * 2 ** attempt)
+    base = min(60000, base)
+    return base + math.floor(random.random() * min(1000, max(50, base * 0.25)))
+
+
+def parse_error(status: int, text: str) -> SkapiError:
+    """A non-2xx answer as a SkapiError, read the way skapi-js reads it."""
+    try:
+        body = json.loads(text)
+    except ValueError:
+        body = text
+    if isinstance(body, str):
+        parts = body.split(":")
+        code = parts[0].strip()
+        message = ":".join(parts[1:]).strip()
+        return SkapiError(message or body, code if code in KNOWN_ERROR_CODES else "ERROR")
+    if isinstance(body, dict) and any(k in body for k in ("message", "stage", "code")):
+        code = body.get("code") or str(status) or "ERROR"
+        message = (body.get("message") or "").strip() or str(code)
+        cause = body.get("cause", body if "stage" in body else None)
+        return SkapiError(message, str(code), cause)
+    return SkapiError(str(body), "ERROR")
+
+
+class Requester:
+    def __init__(self, service: str, owner: str, version: str, target_cdn: Optional[str] = None, timeout: float = 120):
+        self.service = service
+        self.owner = owner
+        self.version = version
+        self.target_cdn = target_cdn or DEFAULT_TARGET_CDN
+        self.timeout = timeout
+        self.public_identifier = ""
+        self._admin: Optional[Dict[str, Any]] = None
+        self._record: Optional[Dict[str, Any]] = None
+        self._lock = threading.Lock()
+        # paging: the startKeys a query has seen, newest last ("end" when the list is done)
+        self._start_key_history: Dict[str, Dict[str, list]] = {}
+
+    # ---- endpoints ------------------------------------------------------------------------------
+
+    def _fetch_endpoint_file(self, name: str) -> Dict[str, Any]:
+        url = f"https://{self.target_cdn}.cloudfront.net/{self.service[:4]}/{name}-{ENDPOINT_VERSION}.json"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url), timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.HTTPError, ValueError, UnicodeDecodeError):
+            raise SkapiError("The project ID does not exist. Create your project from skapi.com", "NOT_EXISTS") from None
+        except (urllib.error.URLError, OSError) as err:
+            raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+
+    def endpoints(self):
+        with self._lock:
+            if self._admin is None:
+                self._admin = self._fetch_endpoint_file("admin")
+            if self._record is None:
+                self._record = self._fetch_endpoint_file("record")
+            return self._admin, self._record
+
+    def _select_gateway(self, kind: str, auth: bool, stable: bool = False) -> str:
+        admin, record = self.endpoints()
+        n = _next_counter()
+        if kind == "admin":
+            suffix = "_private" if auth else "_public"
+            items = [v for k, v in admin.items() if suffix in k and k not in ("get_users_private", "service_public") and isinstance(v, str)]
+            if not items:
+                raise SkapiError("No available admin gateways.", "INVALID_REQUEST")
+        else:
+            prefix = "record_private" if auth else "record_public"
+            items = [v for k, v in record.items() if prefix in k and isinstance(v, str)]
+            if not items:
+                raise SkapiError("No available record gateways.", "INVALID_REQUEST")
+            if stable:
+                return items[0]
+        return items[n % len(items)]
+
+    def endpoint_url(self, dest: str, auth: bool, stable: bool = False) -> str:
+        admin, record = self.endpoints()
+        path, _, query = dest.partition("?")
+        query = "?" + query if query else ""
+        if path == "get-users":
+            base = admin["get_users_private"]
+        elif path == "service":
+            base = admin["service_public"]
+        elif path in ADMIN_ROUND_ROBIN:
+            base = self._select_gateway("admin", auth)
+        elif path == "post-record":
+            base = record["post_private"] if auth else record["post_public"]
+        elif path == "get-records":
+            base = record["get_private"] if auth else record["get_public"]
+        elif path in ("del-files", "del-records"):
+            base = record["del_private"]
+        elif path in RECORD_ROUND_ROBIN:
+            base = self._select_gateway("record", auth, stable)
+        else:
+            if not path.startswith(("https://", "http://")):
+                raise SkapiError(f'"{dest}" is not a valid url.', "INVALID_PARAMETER")
+            return dest
+        return base + path + query
+
+    # ---- request ----------------------------------------------------------------------------------
+
+    def request(self, dest: str, data: Any = None, *, auth: bool = False, method: str = "POST",
+                token: Optional[str] = None, fetch_options: Optional[Dict[str, Any]] = None,
+                ignore_service: bool = False, stable_gateway: bool = False, content_type: Optional[str] = "application/json",
+                raw: bool = False, extra_headers: Optional[Dict[str, str]] = None) -> Any:
+        """
+        token: the idToken, already fresh, when auth is on (sent raw as Authorization).
+        fetch_options: limit, startKey, ascending (sent) and fetchMore (paging, not sent).
+        raw: return the response bytes as they are.
+        """
+        method = method.upper()
+        url = self.endpoint_url(dest, auth, stable_gateway)
+        service = (data or {}).get("service") if isinstance(data, dict) else None
+        owner = (data or {}).get("owner") if isinstance(data, dict) else None
+        service = service or self.service
+        owner = owner or self.owner
+
+        fetch_options = dict(fetch_options or {})
+        fetch_more = bool(fetch_options.pop("fetchMore", fetch_options.pop("fetch_more", False)))
+        if "start_key" in fetch_options and "startKey" not in fetch_options:
+            fetch_options["startKey"] = fetch_options.pop("start_key")
+        sent_options: Dict[str, Any] = {}
+        if "limit" in fetch_options and fetch_options["limit"] is not None:
+            limit = fetch_options["limit"]
+            if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+                raise SkapiError("Fetch limit should be a number.", "INVALID_REQUEST")
+            if limit > 1000:
+                raise SkapiError("Fetch limit should be below 1000.", "INVALID_REQUEST")
+            sent_options["limit"] = limit
+        if fetch_options.get("startKey") is not None:
+            sent_options["startKey"] = fetch_options["startKey"]
+        if "ascending" in fetch_options and fetch_options["ascending"] is not None:
+            if not isinstance(fetch_options["ascending"], bool):
+                raise SkapiError('"ascending" should be a boolean.', "INVALID_PARAMETER")
+            sent_options["ascending"] = fetch_options["ascending"]
+
+        body: Any = {} if ignore_service else {"service": service, "owner": owner}
+        body.update(sent_options)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                body[k] = v
+        elif data:
+            body = data
+
+        # paging: a query asked again with fetchMore continues from the last startKey it got
+        history_key = None
+        if isinstance(body, dict):
+            start_key = body.get("startKey")
+            if start_key:
+                if start_key == "start":
+                    del body["startKey"]
+                    fetch_more = False
+                elif not (start_key == "end" or (isinstance(start_key, dict) and start_key)):
+                    raise SkapiError(f'"{start_key}" is invalid startKey key.', "INVALID_PARAMETER")
+            fingerprint = f"{method}:{'auth' if auth else 'public'}:{dest}"
+            # the private key of a shared record is attached once this client has it (after page 1),
+            # so it stays out of the paging key: the next page of the same query continues the same list
+            params_for_key = {k: v for k, v in body.items() if k not in ("startKey", "private_key")}
+            history_key = _md5(fingerprint + "/" + js_json(_sorted_keys(params_for_key)))
+            history = self._start_key_history.setdefault(dest, {})
+            if not fetch_more:
+                history.pop(history_key, None)
+            elif history.get(history_key):
+                last = history[history_key][-1]
+                if last == "end":
+                    return {"list": [], "startKey": "end", "endOfList": True, "startKeyHistory": list(history[history_key])}
+                body["startKey"] = json.loads(last)
+
+        headers = {"Accept": "*/*"}
+        if content_type:
+            headers["Content-Type"] = content_type
+        if token:
+            headers["Authorization"] = token
+        if extra_headers:
+            headers.update(extra_headers)
+        headers["Content-Meta"] = js_json({
+            "public_identifier": self.public_identifier,
+            "service": service,
+            "owner": owner,
+            "resolves_offloaded_data": True,
+            "skapi_version": self.version,
+            "expiring_private_keys": True,  # renews private access keys before they expire, so 1-hour keys are safe
+        })
+
+        payload = None
+        if method == "GET":
+            if isinstance(body, dict) and body:
+                pairs = "&".join(
+                    encode_uri_component(str(k)) + "=" + encode_uri_component(v if isinstance(v, str) else js_json(v))
+                    for k, v in body.items())
+                url += ("?" if "?" not in url else ("" if url.endswith(("?", "&")) else "&")) + pairs
+        elif isinstance(body, (bytes, bytearray)):
+            payload = bytes(body)
+        elif isinstance(body, str):
+            payload = body.encode("utf-8")
+        elif body:
+            payload = js_json(body).encode("utf-8")
+
+        result = self._send(url, method, headers, payload, raw)
+
+        if history_key is not None and isinstance(result, dict) and result.get("startKey"):
+            seen = self._start_key_history.setdefault(dest, {}).setdefault(history_key, [])
+            entry = "end" if result["startKey"] == "end" else js_json(result["startKey"])
+            if entry not in seen:
+                seen.append(entry)
+            result = dict({"startKeyHistory": list(seen)}, **result)
+        return result
+
+    def _send(self, url: str, method: str, headers: Dict[str, str], payload: Optional[bytes], raw: bool = False) -> Any:
+        attempt = 0
+        while True:
+            req = urllib.request.Request(url, data=payload, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    content = resp.read()
+                if raw:
+                    return content
+                text = content.decode("utf-8", errors="replace")
+                try:
+                    return json.loads(text)
+                except ValueError:
+                    return text
+            except urllib.error.HTTPError as err:
+                text = err.read().decode("utf-8", errors="replace")
+                if err.code == 429:
+                    delay = _retry_delay_ms(err.headers.get("Retry-After") if err.headers else None)
+                    if delay is None:
+                        # a 429 that carries its own error (a ticket whose slots are all taken) keeps it
+                        carried = parse_error(err.code, text) if text.strip() else None
+                        if carried is not None and carried.code not in ("ERROR", "429"):
+                            raise carried from None
+                        raise SkapiError("Too many requests", "ERROR") from None
+                    if attempt >= RATE_LIMIT_MAX_RETRIES:
+                        raise SkapiError(f'Too many requests: "{url.split("?")[0]}" still answered 429 after {RATE_LIMIT_MAX_RETRIES} retries.',
+                                         "TOO_MANY_REQUESTS") from None
+                    time.sleep(_rate_limit_wait_ms(delay, attempt) / 1000)
+                    attempt += 1
+                    continue
+                raise parse_error(err.code, text) from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
+                raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+
+    def fetch_plain(self, url: str) -> bytes:
+        """A plain GET with no extra headers: for pre-signed links, whose signature covers the headers."""
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=self.timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as err:
+            text = err.read().decode("utf-8", errors="replace")
+            code = re.search(r"<Code>(.*?)</Code>", text)
+            message = re.search(r"<Message>(.*?)</Message>", text)
+            if code or message:
+                raise SkapiError(message.group(1) if message else text[:300], code.group(1) if code else "ERROR") from None
+            raise parse_error(err.code, text) from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
+            raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+
+    def upload(self, url: str, fields: Dict[str, str], filename: str, content: bytes, content_type: Optional[str]) -> Any:
+        """multipart/form-data POST to a signed upload URL: every field in order, then the file."""
+        boundary = "----skapi" + hashlib.md5(str(random.random()).encode()).hexdigest()
+        parts = []
+        for k, v in fields.items():
+            parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode("utf-8"))
+        safe_name = filename.replace('"', "%22").replace("\r", "").replace("\n", "")
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'
+                     f'Content-Type: {content_type or "application/octet-stream"}\r\n\r\n'.encode("utf-8"))
+        parts.append(content)
+        parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+        return self._send(url, "POST", {"Content-Type": f"multipart/form-data; boundary={boundary}"}, b"".join(parts))
