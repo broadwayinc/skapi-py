@@ -6,17 +6,19 @@ paging, matching skapi-js (src/utils/network.ts) so the server sees the same req
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import math
 import random
 import re
+import socket
 import threading
 import time
 import urllib.error
 import urllib.request
 from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from .errors import SkapiError
 
@@ -24,6 +26,23 @@ DEFAULT_TARGET_CDN = "d3e9syvbtso631"
 ENDPOINT_VERSION = "v2"
 KNOWN_ERROR_CODES = ["INVALID_CORS", "INVALID_REQUEST", "SERVICE_DISABLED", "INVALID_PARAMETER", "ERROR", "EXISTS", "NOT_EXISTS"]
 RATE_LIMIT_MAX_RETRIES = 6
+# Uploads (2.4.4): the body goes out in blocks of this size, each with its own `timeout`, so the
+# limit is "no progress for `timeout` seconds", never the file's total time. urllib sends a bytes
+# body with ONE sendall(), and since Python 3.5 the socket timeout covers that whole call: an
+# upload taking longer than `timeout` was cut off while still moving.
+UPLOAD_BLOCK_BYTES = 64 * 1024
+# Once the whole body is handed off, MB can still drain from the OS buffers with nothing to show;
+# the answer may take this many times `timeout` before the upload counts as stalled.
+UPLOAD_SENT_WAIT_FACTOR = 5
+
+
+def _timed_out(err: BaseException) -> bool:
+    """True when `err` is the socket limit running out (nothing moved for `timeout` seconds), also
+    when urllib wraps it in URLError. socket.timeout is TimeoutError from Python 3.10, an OSError
+    of its own on 3.9."""
+    if isinstance(err, urllib.error.URLError) and not isinstance(err, urllib.error.HTTPError):
+        err = err.reason if isinstance(err.reason, BaseException) else err
+    return isinstance(err, (socket.timeout, TimeoutError))
 
 ADMIN_ROUND_ROBIN = {
     "get-newsletters", "get-public-newsletters", "subscribe-newsletter", "subscribe-public-newsletter",
@@ -342,6 +361,10 @@ class Requester:
                     continue
                 raise parse_error(err.code, text) from None
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
+                # A connection with nothing moving for `timeout` seconds fails with TIMEOUT, as in
+                # skapi-js 2.4.4 (its "No response for 60 seconds."); other failures stay NETWORK_ERROR.
+                if _timed_out(err):
+                    raise SkapiError(f"No response for {self.timeout:g} seconds.", "TIMEOUT", err) from None
                 raise SkapiError("Network error", "NETWORK_ERROR", err) from None
 
     def fetch_plain(self, url: str) -> bytes:
@@ -357,6 +380,8 @@ class Requester:
                 raise SkapiError(message.group(1) if message else text[:300], code.group(1) if code else "ERROR") from None
             raise parse_error(err.code, text) from None
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
+            if _timed_out(err):
+                raise SkapiError(f"No response for {self.timeout:g} seconds.", "TIMEOUT", err) from None
             raise SkapiError("Network error", "NETWORK_ERROR", err) from None
 
     def upload(self, url: str, fields: Dict[str, str], filename: str, content: bytes, content_type: Optional[str]) -> Any:
@@ -370,4 +395,55 @@ class Requester:
                      f'Content-Type: {content_type or "application/octet-stream"}\r\n\r\n'.encode("utf-8"))
         parts.append(content)
         parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
-        return self._send(url, "POST", {"Content-Type": f"multipart/form-data; boundary={boundary}"}, b"".join(parts))
+        return self._send_upload(url, {"Content-Type": f"multipart/form-data; boundary={boundary}"}, b"".join(parts), filename)
+
+    def _send_upload(self, url: str, headers: Dict[str, str], payload: bytes, filename: str) -> Any:
+        """POST an upload body with an idle limit: `timeout` per block sent, UPLOAD_SENT_WAIT_FACTOR x
+        `timeout` for the answer once all of it is sent. Same answers and 429 retries as _send."""
+        attempt = 0
+        while True:
+            parts = urlsplit(url)
+            conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+            conn = conn_cls(parts.hostname, parts.port, timeout=self.timeout)
+            path = (parts.path or "/") + ("?" + parts.query if parts.query else "")
+            sent = False
+            try:
+                conn.putrequest("POST", path)
+                for k, v in headers.items():
+                    conn.putheader(k, v)
+                conn.putheader("Content-Length", str(len(payload)))
+                conn.endheaders()
+                view = memoryview(payload)
+                for i in range(0, len(payload), UPLOAD_BLOCK_BYTES):
+                    conn.send(view[i:i + UPLOAD_BLOCK_BYTES])
+                sent = True
+                if conn.sock is not None and self.timeout:
+                    conn.sock.settimeout(self.timeout * UPLOAD_SENT_WAIT_FACTOR)
+                resp = conn.getresponse()
+                status, retry_after, content = resp.status, resp.getheader("Retry-After"), resp.read()
+            except (socket.timeout, TimeoutError) as err:
+                wait = self.timeout * (UPLOAD_SENT_WAIT_FACTOR if sent else 1)
+                raise SkapiError(
+                    f'Upload timeout: no answer for "{filename}" {wait:g} seconds after it was sent.' if sent
+                    else f'Upload timeout: "{filename}" sent nothing for {wait:g} seconds.', "TIMEOUT", err) from None
+            except (OSError, http.client.HTTPException) as err:
+                raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+            finally:
+                conn.close()
+            text = content.decode("utf-8", errors="replace")
+            if 200 <= status < 300:
+                try:
+                    return json.loads(text)
+                except ValueError:
+                    return text
+            if status == 429:
+                delay = _retry_delay_ms(retry_after)
+                if delay is None:
+                    raise SkapiError("Too many requests", "ERROR") from None
+                if attempt >= RATE_LIMIT_MAX_RETRIES:
+                    raise SkapiError(f'Too many requests: the upload of "{filename}" still answered 429 after {RATE_LIMIT_MAX_RETRIES} retries.',
+                                     "TOO_MANY_REQUESTS") from None
+                time.sleep(_rate_limit_wait_ms(delay, attempt) / 1000)
+                attempt += 1
+                continue
+            raise parse_error(status, text)

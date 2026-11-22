@@ -27,11 +27,22 @@ METHODS = ("get", "post", "delete", "put", "patch", "head")
 UPPER_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
 STREAM_DEGRADED_RETRIES = 3
 MULTIPART_LIMIT = 2 * 1024 * 1024 - 64 * 1024
+# The shortest polling interval accepted, in milliseconds (skapi-js 2.4.4 MIN_POLL_INTERVAL_MS). A
+# shorter one is refused with INVALID_PARAMETER, never raised quietly: applies to forward_request's
+# `poll` (0 still means "do not poll"), forward_request_poll's `poll` and forward_request_stream's `poll`.
+MIN_POLL_INTERVAL_MS = 1000
 
 
 def _jd(v):
     """A value as it appears in an error message; never fails on odd types."""
     return json.dumps(v, default=repr, ensure_ascii=False)
+
+
+def _assert_poll_interval(value: Any, name: str = "poll") -> None:
+    """Refuse an interval that is not a finite number of at least MIN_POLL_INTERVAL_MS."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value \
+            or value in (float("inf"), float("-inf")) or value < MIN_POLL_INTERVAL_MS:
+        raise _p(f'"{name}" should be a number of milliseconds, {MIN_POLL_INTERVAL_MS} or more.')
 
 
 def _p(message: str, code: str = "INVALID_PARAMETER") -> SkapiError:
@@ -132,7 +143,7 @@ class ForwardMixin:
         """
         Calls another API through Skapi. options: url (required), method, headers, data, params,
         secretName (a client secret stored on skapi.com; put "$CLIENT_SECRET" where it goes),
-        skapiHeaders, queue, expires, stream, poll (milliseconds between checks), multipart.
+        skapiHeaders, queue, expires, stream, poll (milliseconds between checks, 1000 or more; 0 does not poll), multipart.
 
         Without queue/poll/stream: returns the API's answer. With poll or stream: waits for the
         answer and returns it, handing streamed text to on_stream(text, seq) as it arrives. With a
@@ -185,8 +196,9 @@ class ForwardMixin:
     def _dispatch_forward(self, params: Dict[str, Any], on_stream: Optional[Callable], response_type: Optional[str]) -> Any:
         secret_named = bool(params.get("secretName"))
         poll = params.pop("poll", None)
-        if isinstance(poll, (int, float)) and not isinstance(poll, bool) and poll < 0:
-            raise _p('"poll" should be a non-negative number.')
+        # 0 (or False, or absent) means "do not poll"; any other number is the interval.
+        if isinstance(poll, (int, float)) and not isinstance(poll, bool) and poll != 0:
+            _assert_poll_interval(poll)
         latency = poll if isinstance(poll, (int, float)) and not isinstance(poll, bool) else (1000 if poll else 0)
         self._ensure_connection()
         signed_in = self._signed_in()
@@ -300,9 +312,8 @@ class ForwardMixin:
         """Waits for a queued request (its request_id, or its short id with url and method) and returns the answer."""
         if isinstance(poll, bool) or not isinstance(poll, (int, float)):
             raise _p('"poll" should be a number.')
-        if poll < 0:
-            raise _p('"poll" should be a non-negative number.')
         poll = poll or 1000
+        _assert_poll_interval(poll)
         full_id = self._request_id(request_id, url, method, service)
         self._ensure_connection()
         cursor, stalled = 0, 0
@@ -340,8 +351,7 @@ class ForwardMixin:
         options = dict(options or {})
         poll = options.get("poll")
         latency = poll if isinstance(poll, (int, float)) and not isinstance(poll, bool) else 1000
-        if latency < 0:
-            raise _p('"poll" should be a non-negative number.')
+        _assert_poll_interval(latency)
         if "since" in options and (isinstance(options["since"], bool) or not isinstance(options["since"], (int, float))):
             raise _p('"since" should be a number.')
         full_id = self._request_id(request_id, options.get("url"), options.get("method"), options.get("service"))

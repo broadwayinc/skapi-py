@@ -29,7 +29,8 @@ class Skapi(EncryptionMixin, DatabaseMixin, UserMixin, SocialMixin, ForwardMixin
     storage: where the signed-in session is kept between runs. None (default) keeps it in memory for
              this object only; a file path keeps it in that JSON file (created with mode 600); or any
              object with get_item(key), set_item(key, value) and remove_item(key).
-    timeout: seconds to wait for each request.
+    timeout: seconds a request may go with nothing sent or received before it fails with TIMEOUT
+             (default 120). An upload may then wait 5 x timeout for its answer.
     encryption: True (or options) seals the data of private records in this client before upload.
              Needs the "cryptography" package: pip install "skapi[encryption]".
     """
