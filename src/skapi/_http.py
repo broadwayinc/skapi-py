@@ -20,7 +20,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Dict, Optional
 from urllib.parse import quote, urlsplit
 
-from .errors import SkapiError
+from .errors import SkapiError, network_error_message
 
 DEFAULT_TARGET_CDN = "d3e9syvbtso631"
 ENDPOINT_VERSION = "v2"
@@ -169,7 +169,7 @@ class Requester:
         except (urllib.error.HTTPError, ValueError, UnicodeDecodeError):
             raise SkapiError("The project ID does not exist. Create your project from skapi.com", "NOT_EXISTS") from None
         except (urllib.error.URLError, OSError) as err:
-            raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+            raise SkapiError(network_error_message(err), "NETWORK_ERROR", err) from None
 
     def endpoints(self):
         with self._lock:
@@ -365,7 +365,7 @@ class Requester:
                 # skapi-js 2.4.4 (its "No response for 60 seconds."); other failures stay NETWORK_ERROR.
                 if _timed_out(err):
                     raise SkapiError(f"No response for {self.timeout:g} seconds.", "TIMEOUT", err) from None
-                raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+                raise SkapiError(network_error_message(err), "NETWORK_ERROR", err) from None
 
     def fetch_plain(self, url: str) -> bytes:
         """A plain GET with no extra headers: for pre-signed links, whose signature covers the headers."""
@@ -382,7 +382,7 @@ class Requester:
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
             if _timed_out(err):
                 raise SkapiError(f"No response for {self.timeout:g} seconds.", "TIMEOUT", err) from None
-            raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+            raise SkapiError(network_error_message(err), "NETWORK_ERROR", err) from None
 
     def upload(self, url: str, fields: Dict[str, str], filename: str, content: bytes, content_type: Optional[str]) -> Any:
         """multipart/form-data POST to a signed upload URL: every field in order, then the file."""
@@ -427,7 +427,7 @@ class Requester:
                     f'Upload timeout: no answer for "{filename}" {wait:g} seconds after it was sent.' if sent
                     else f'Upload timeout: "{filename}" sent nothing for {wait:g} seconds.', "TIMEOUT", err) from None
             except (OSError, http.client.HTTPException) as err:
-                raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+                raise SkapiError(network_error_message(err), "NETWORK_ERROR", err) from None
             finally:
                 conn.close()
             text = content.decode("utf-8", errors="replace")

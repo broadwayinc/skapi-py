@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import urllib.error
 from typing import Any, Optional
 
 
@@ -24,3 +25,14 @@ class SkapiError(Exception):
 
     def __repr__(self) -> str:
         return f"SkapiError(code={self.code!r}, message={self.message!r})"
+
+
+def network_error_message(err: BaseException) -> str:
+    """'Network error: <reason>' for a failed connection, so the real cause (for example
+    '[SSL: CERTIFICATE_VERIFY_FAILED] ...') shows in the message and the traceback."""
+    if isinstance(err, urllib.error.URLError) and isinstance(err.reason, BaseException):
+        err = err.reason
+    elif isinstance(err, urllib.error.URLError):
+        err = err.reason or err
+    text = str(err).strip()
+    return f"Network error: {text}" if text else "Network error"

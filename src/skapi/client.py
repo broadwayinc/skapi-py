@@ -211,7 +211,7 @@ class Skapi(EncryptionMixin, DatabaseMixin, UserMixin, SocialMixin, ForwardMixin
                 if self._sign_outs != epoch:
                     self._signed_out_meanwhile(pool, username)
                 if err.code == "NetworkError":
-                    raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+                    raise SkapiError(err.message or "Network error", "NETWORK_ERROR", err) from None
                 self._clear_session()
                 raise SkapiError("User login is required.", "INVALID_REQUEST", err) from None
             with self._session_lock:

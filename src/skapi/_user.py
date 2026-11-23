@@ -230,7 +230,7 @@ class UserMixin:
             if code in ("TooManyRequestsException", "LimitExceededException"):
                 raise SkapiError("Too many attempts. Please try again later.", "REQUEST_EXCEED", err) from None
             if code == "NetworkError":
-                raise SkapiError("Network error", "NETWORK_ERROR", err) from None
+                raise SkapiError(err.message or "Network error", "NETWORK_ERROR", err) from None
             parsed = _parsed_cognito_error(err)
             if parsed.code == "SIGNUP_CONFIRMATION_NEEDED":
                 self._request_signup_confirmation = username

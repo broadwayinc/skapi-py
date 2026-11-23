@@ -22,6 +22,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
 
+from .errors import network_error_message
 from ._srp import SrpHelper, cognito_timestamp, hex_to_int
 
 REQUEST_TIMEOUT = 60  # seconds per call to the user pool API
@@ -199,8 +200,8 @@ class CognitoClient:
             if header:
                 raise CognitoError(str(err.code), header.split(":")[0], err.code) from None
             raise CognitoError(str(err.code), "UnknownError", err.code) from None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
-            raise CognitoError("Network error", "NetworkError") from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
+            raise CognitoError(network_error_message(err), "NetworkError") from None
 
     def request_with_retry(self, operation: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """
