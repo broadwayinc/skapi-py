@@ -709,7 +709,11 @@ class DatabaseMixin:
                     raise _err('"reference_limit" should be >= 0')
                 if v > 4503599627370546:
                     raise _err('"reference_limit" should be <= 4503599627370546')
-            for k in ("prevent_multiple_referencing", "can_remove_referencing_records", "only_granted_can_reference", "allow_granted_to_grant_others"):
+            # can_modify_referencing_records: this record's owner may update the data, tags and index of
+            # records that reference it, or unlink them (reference None). Set it when creating the record;
+            # an update can only turn it off (turning it on later is for the project owner / group 99).
+            for k in ("prevent_multiple_referencing", "can_remove_referencing_records", "can_modify_referencing_records",
+                      "only_granted_can_reference", "allow_granted_to_grant_others"):
                 if k in s and not isinstance(s[k], bool):
                     raise _err(f'"source.{k}" should be type: <boolean>.')
             if "referencing_index_restrictions" in s:
@@ -1246,7 +1250,7 @@ class DatabaseMixin:
                       "notify_subscribers": False, "feed_referencing_records": False, "notify_referencing_records": False}},
             "referenced_count": 0,
             "source": {"referencing_limit": None, "prevent_multiple_referencing": False, "can_remove_referencing_records": False,
-                       "only_granted_can_reference": False},
+                       "can_modify_referencing_records": False, "only_granted_can_reference": False},
             "ip": "", "bin": {},
         }
         anonymous = False
@@ -1274,7 +1278,11 @@ class DatabaseMixin:
         ct_url = ct_urls[0] if ct_urls else None
 
         if "ip" in record:
-            parts = str(record["ip"]).split("#")
+            # Stored as "<address>[R]#<unique_id>". The address is redacted for anyone but the uploader,
+            # the project owner and access group 99: it comes back empty ("R#<unique_id>", "#<unique_id>" or "")
+            # for a signed-in uploader and as 0-0-0-0 for an anonymous one, so the anonymous check below
+            # still holds and the readonly flag and unique_id are still read.
+            parts = (record["ip"] if isinstance(record["ip"], str) else "").split("#")
             ip = parts[0]
             if len(parts) > 1:
                 out["unique_id"] = "#".join(parts[1:])
@@ -1344,7 +1352,15 @@ class DatabaseMixin:
                 out["bin"].setdefault(path_key, []).append(entry)
         if isinstance(record.get("prv_acs"), dict):
             for k, v in record["prv_acs"].items():
-                if k in ("notify_subscribers", "upload_to_feed", "feed_referencing_records", "notify_referencing_records"):
+                if k == "upb":
+                    # Not a source setting: the user id of whoever last updated this record when that
+                    # was not its uploader (the referenced record's user through
+                    # can_modify_referencing_records, the project owner or an admin). The backend keeps
+                    # it in prv_acs because prv_acs is projected into every index, and drops it once
+                    # the uploader updates the record again.
+                    if isinstance(v, str) and v:
+                        out["updated_by"] = v
+                elif k in ("notify_subscribers", "upload_to_feed", "feed_referencing_records", "notify_referencing_records"):
                     out["table"]["subscription"][k] = v
                 elif k == "referencing_index_restrictions" and isinstance(v, list):
                     out["source"][k] = [dict(i, name=decode_delimiters(i["name"])) if isinstance(i, dict) and isinstance(i.get("name"), str) else i for i in v]
