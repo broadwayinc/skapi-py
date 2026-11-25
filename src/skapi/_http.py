@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 from email.utils import parsedate_to_datetime
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 from urllib.parse import quote, urlsplit
 
 from .errors import SkapiError, network_error_message
@@ -126,22 +126,36 @@ def _rate_limit_wait_ms(delay: float, attempt: int) -> float:
     return base + math.floor(random.random() * min(1000, max(50, base * 0.25)))
 
 
-def parse_error(status: int, text: str) -> SkapiError:
-    """A non-2xx answer as a SkapiError, read the way skapi-js reads it."""
+def parse_error(status: int, text: str, server_fault: bool = False) -> SkapiError:
+    """
+    A non-2xx answer as a SkapiError, read the way skapi-js reads it.
+
+    server_fault: on the regular request path (not uploads, not signed links), a 5xx other than
+    501 is SERVER_ERROR whatever the body says, so a caller can tell "try again" from "no"
+    (skapi-js 2.7.0). The body is kept on `cause`. 501 says the route does not exist here,
+    which is an answer.
+    """
     try:
         body = json.loads(text)
     except ValueError:
         body = text
+    fault = server_fault and status >= 500 and status != 501
     if isinstance(body, str):
         parts = body.split(":")
         code = parts[0].strip()
         message = ":".join(parts[1:]).strip()
+        if fault:
+            return SkapiError(message or body or f"Server error {status}.", "SERVER_ERROR", body)
         return SkapiError(message or body, code if code in KNOWN_ERROR_CODES else "ERROR")
     if isinstance(body, dict) and any(k in body for k in ("message", "stage", "code")):
         code = body.get("code") or str(status) or "ERROR"
         message = (body.get("message") or "").strip() or str(code)
         cause = body.get("cause", body if "stage" in body else None)
+        if fault:
+            return SkapiError(message, "SERVER_ERROR", body if cause is None else cause)
         return SkapiError(message, str(code), cause)
+    if fault:
+        return SkapiError(f"Server error {status}.", "SERVER_ERROR", body)
     return SkapiError(str(body), "ERROR")
 
 
@@ -163,13 +177,30 @@ class Requester:
 
     def _fetch_endpoint_file(self, name: str) -> Dict[str, Any]:
         url = f"https://{self.target_cdn}.cloudfront.net/{self.service[:4]}/{name}-{ENDPOINT_VERSION}.json"
+        # Only the CDN's "no such file" (403 or 404) means the project does not exist. Anything else is
+        # a failure on the way, reported with a code a caller (and a poll) retries: before, a passing
+        # CDN error or a cut-off answer said "The project ID does not exist", and the next call, which
+        # fetches the list again, worked.
         try:
             with urllib.request.urlopen(urllib.request.Request(url), timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.HTTPError, ValueError, UnicodeDecodeError):
-            raise SkapiError("The project ID does not exist. Create your project from skapi.com", "NOT_EXISTS") from None
-        except (urllib.error.URLError, OSError) as err:
+                body = resp.read()
+        except urllib.error.HTTPError as err:
+            if err.code in (403, 404):
+                raise SkapiError("The project ID does not exist. Create your project from skapi.com", "NOT_EXISTS") from None
+            if err.code == 429:
+                raise SkapiError("Too many requests", "RATE_LIMITED") from None
+            raise SkapiError(f"Server error {err.code}.", "SERVER_ERROR") from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
+            if _timed_out(err):
+                raise SkapiError(f"No response for {self.timeout:g} seconds.", "TIMEOUT", err) from None
             raise SkapiError(network_error_message(err), "NETWORK_ERROR", err) from None
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            parsed = None
+        if not isinstance(parsed, dict):
+            raise SkapiError(f'Network error: the project\'s endpoint list "{name}" arrived incomplete.', "NETWORK_ERROR")
+        return parsed
 
     def endpoints(self):
         with self._lock:
@@ -225,11 +256,14 @@ class Requester:
     def request(self, dest: str, data: Any = None, *, auth: bool = False, method: str = "POST",
                 token: Optional[str] = None, fetch_options: Optional[Dict[str, Any]] = None,
                 ignore_service: bool = False, stable_gateway: bool = False, content_type: Optional[str] = "application/json",
-                raw: bool = False, extra_headers: Optional[Dict[str, str]] = None) -> Any:
+                raw: bool = False, extra_headers: Optional[Dict[str, str]] = None,
+                keep_paging: Optional[Callable[[], bool]] = None) -> Any:
         """
         token: the idToken, already fresh, when auth is on (sent raw as Authorization).
         fetch_options: limit, startKey, ascending (sent) and fetchMore (paging, not sent).
         raw: return the response bytes as they are.
+        keep_paging: asked before the answer's startKey is saved for fetchMore; False when the caller
+        already gave up on this answer (deadline or signal), so the next fetchMore asks for the same page.
         """
         method = method.upper()
         url = self.endpoint_url(dest, auth, stable_gateway)
@@ -321,7 +355,8 @@ class Requester:
 
         result = self._send(url, method, headers, payload, raw)
 
-        if history_key is not None and isinstance(result, dict) and result.get("startKey"):
+        if history_key is not None and isinstance(result, dict) and result.get("startKey") \
+                and (keep_paging is None or keep_paging()):
             seen = self._start_key_history.setdefault(dest, {}).setdefault(history_key, [])
             entry = "end" if result["startKey"] == "end" else js_json(result["startKey"])
             if entry not in seen:
@@ -344,7 +379,11 @@ class Requester:
                 except ValueError:
                     return text
             except urllib.error.HTTPError as err:
-                text = err.read().decode("utf-8", errors="replace")
+                try:
+                    text = err.read().decode("utf-8", errors="replace")
+                except (OSError, http.client.HTTPException) as cut:
+                    # the connection dropped inside the error body: a transport failure, as above
+                    raise SkapiError(network_error_message(cut), "NETWORK_ERROR", cut) from None
                 if err.code == 429:
                     delay = _retry_delay_ms(err.headers.get("Retry-After") if err.headers else None)
                     if delay is None:
@@ -352,17 +391,20 @@ class Requester:
                         carried = parse_error(err.code, text) if text.strip() else None
                         if carried is not None and carried.code not in ("ERROR", "429"):
                             raise carried from None
-                        raise SkapiError("Too many requests", "ERROR") from None
+                        # 2.7.0: a coded transport failure, as skapi-js "Too many requests" (RATE_LIMITED)
+                        raise SkapiError("Too many requests", "RATE_LIMITED") from None
                     if attempt >= RATE_LIMIT_MAX_RETRIES:
                         raise SkapiError(f'Too many requests: "{url.split("?")[0]}" still answered 429 after {RATE_LIMIT_MAX_RETRIES} retries.',
                                          "TOO_MANY_REQUESTS") from None
                     time.sleep(_rate_limit_wait_ms(delay, attempt) / 1000)
                     attempt += 1
                     continue
-                raise parse_error(err.code, text) from None
-            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
+                raise parse_error(err.code, text, server_fault=True) from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as err:
                 # A connection with nothing moving for `timeout` seconds fails with TIMEOUT, as in
                 # skapi-js 2.4.4 (its "No response for 60 seconds."); other failures stay NETWORK_ERROR.
+                # http.client.HTTPException covers a connection dropped inside the answer (IncompleteRead,
+                # BadStatusLine), which skapi-js sees as xhr.onerror: NETWORK_ERROR, so a poll keeps going.
                 if _timed_out(err):
                     raise SkapiError(f"No response for {self.timeout:g} seconds.", "TIMEOUT", err) from None
                 raise SkapiError(network_error_message(err), "NETWORK_ERROR", err) from None
@@ -379,7 +421,7 @@ class Requester:
             if code or message:
                 raise SkapiError(message.group(1) if message else text[:300], code.group(1) if code else "ERROR") from None
             raise parse_error(err.code, text) from None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as err:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException) as err:
             if _timed_out(err):
                 raise SkapiError(f"No response for {self.timeout:g} seconds.", "TIMEOUT", err) from None
             raise SkapiError(network_error_message(err), "NETWORK_ERROR", err) from None
@@ -439,7 +481,8 @@ class Requester:
             if status == 429:
                 delay = _retry_delay_ms(retry_after)
                 if delay is None:
-                    raise SkapiError("Too many requests", "ERROR") from None
+                    # as skapi-js uploads (toFileUploadError): TOO_MANY_REQUESTS
+                    raise SkapiError("Too many requests", "TOO_MANY_REQUESTS") from None
                 if attempt >= RATE_LIMIT_MAX_RETRIES:
                     raise SkapiError(f'Too many requests: the upload of "{filename}" still answered 429 after {RATE_LIMIT_MAX_RETRIES} retries.',
                                      "TOO_MANY_REQUESTS") from None

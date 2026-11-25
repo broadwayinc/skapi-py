@@ -19,6 +19,7 @@ import warnings
 from typing import Any, Callable, Dict, Optional
 
 from ._database import user_id as _user_id
+from ._request_status import is_status_push_frame
 from ._ws import WebSocket, WebSocketClosed
 from .errors import SkapiError
 
@@ -76,6 +77,15 @@ class _Realtime:
         except Exception as err:
             warnings.warn(f"realtime callback raised {err!r}", RuntimeWarning, stacklevel=2)
 
+    def push_event(self, name: str) -> None:
+        """Tells the request status push (if in use) that the connection came up or went away."""
+        state = getattr(self.skapi, "_status_push_state", None)
+        if state is not None:
+            try:
+                getattr(state, name)()
+            except Exception as err:
+                warnings.warn(f"request status push raised {err!r}", RuntimeWarning, stacklevel=2)
+
     # ---- connection -------------------------------------------------------------------------------
 
     def open(self, renew: bool = False) -> None:
@@ -103,6 +113,7 @@ class _Realtime:
             self.send_raw({"action": "joinRoom", "rid": self.room, "token": self.skapi._session.access_token.jwt_token, "ver": 2})
         threading.Thread(target=self.read_loop, args=(ws, generation), daemon=True, name="skapi-realtime-read").start()
         threading.Thread(target=self.ping_loop, args=(ws, generation), daemon=True, name="skapi-realtime-ping").start()
+        self.push_event("socket_up")
         if renew and old is not None:
             try:
                 old.close()
@@ -164,6 +175,7 @@ class _Realtime:
         except OSError:
             pass
         self.emit({"type": "error", "message": "Skapi: WebSocket unexpected close."})
+        self.push_event("socket_down")
         self.schedule_reconnect(generation)
 
     def schedule_reconnect(self, generation: int) -> None:
@@ -196,6 +208,7 @@ class _Realtime:
             except (WebSocketClosed, OSError):
                 if self.current(generation):
                     self.emit({"type": "error", "message": "Skapi: WebSocket unexpected close."})
+                    self.push_event("socket_down")
                     self.schedule_reconnect(generation)
                 elif self.closing and generation == self.generation:
                     self.emit({"type": "close", "message": "WebSocket connection closed."})
@@ -214,6 +227,16 @@ class _Realtime:
         if "#pong" in data:
             self.pong_seen = True
             self.pongless_pings = 0
+            return
+        if is_status_push_frame(data):
+            # A request status push (2.5.0, _request_status.py). Not a message for the app: no
+            # user sent it, so the app's callback never sees it.
+            state = getattr(self.skapi, "_status_push_state", None)
+            if state is not None:
+                try:
+                    state.on_frame(data)
+                except Exception as err:
+                    warnings.warn(f"request status push raised {err!r}", RuntimeWarning, stacklevel=2)
             return
         if isinstance(data.get("#presence"), list):
             rid = data.get("#srid")
@@ -380,6 +403,7 @@ class _Realtime:
         if ws is not None:
             ws.close()
         self.forget_order()
+        self.push_event("socket_down")
 
 
 class RealtimeMixin:
@@ -387,7 +411,7 @@ class RealtimeMixin:
 
     _rt: Optional[_Realtime] = None
 
-    def connect_realtime(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+    def connect_realtime(self, callback: Callable[[Dict[str, Any]], None], *, _status_push: bool = False) -> None:
         """
         Opens the realtime connection. callback(event) runs on a background thread for every
         message, notice and connection event. Returns once connected; reconnects on its own.
@@ -397,17 +421,27 @@ class RealtimeMixin:
         self._ensure_connection()
         if not self._signed_in():
             raise SkapiError("No access.", "INVALID_REQUEST")
-        if self._rt is not None and not self._rt.closing:
-            self._rt.callback = callback
-            return
-        rt = _Realtime(self, callback)
-        self._rt = rt
-        try:
-            rt.open()
-        except SkapiError:
-            self._rt = None
-            rt.emit({"type": "error", "message": "Skapi: WebSocket connection failed."})
-            raise
+        # One connect at a time: a call made while another is still opening waits for it and then
+        # shares that connection (or opens its own if that one failed).
+        with self._rt_connect_lock:
+            state = getattr(self, "_status_push_state", None)
+            if self._rt is not None and not self._rt.closing:
+                if _status_push:
+                    return  # a connection is already there: the status push only listens on it
+                self._rt.callback = callback
+                if state is not None:
+                    state.app_took_connection()  # opened for status push, the app's from now on
+                return
+            rt = _Realtime(self, callback)
+            self._rt = rt
+            try:
+                rt.open()
+            except SkapiError:
+                self._rt = None
+                rt.emit({"type": "error", "message": "Skapi: WebSocket connection failed."})
+                raise
+            if _status_push and state is not None:
+                state.push_opened(rt)  # the status push's to close, until the app takes it
 
     def close_realtime(self) -> None:
         """Closes the realtime connection; the group hears that you disconnected and left."""

@@ -6,7 +6,7 @@ project's database with the same API as skapi-js.
     skapi = Skapi("<Project ID>")
 """
 
-__version__ = "2.5.0"
+__version__ = "2.7.0"
 
 from .errors import SkapiError  # noqa: E402
 from .client import Skapi  # noqa: E402

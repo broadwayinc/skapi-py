@@ -360,7 +360,7 @@ class UserMixin:
                 # the stored tokens had expired and were just refreshed: one refresh, not two
                 self._restore_refreshed_token = None
             else:
-                self._refresh_session()
+                self._refresh_session(new_claims=True)
             return self.user
         except SkapiError:
             return None
@@ -552,7 +552,7 @@ class UserMixin:
                 self._user_pool().call("UpdateUserAttributes", self._access_token(), UserAttributes=attributes)
             except CognitoError as err:
                 raise SkapiError(err.message or "Failed to update user settings.", err.code or err.name, err) from None
-            self._refresh_session()
+            self._refresh_session(new_claims=True)
         return self.user
 
     def change_password(self, current_password: str, new_password: str) -> str:
@@ -636,7 +636,7 @@ class UserMixin:
         try:
             if code:
                 self._user_pool().call("VerifyUserAttribute", self._access_token(), AttributeName="email", Code=code)
-                self._refresh_session()
+                self._refresh_session(new_claims=True)
                 self._user["email_verified"] = True
                 return 'SUCCESS: "email" is verified.'
             self._user_pool().call("GetUserAttributeVerificationCode", self._access_token(), AttributeName="email", ClientMetadata=metadata)
@@ -650,7 +650,7 @@ class UserMixin:
         body = {} if revert is None else {"revert": revert}
         reply = self._call("last-verified-email", body, auth=True)
         if isinstance(reply, str) and "SUCCESS" in reply:
-            self._refresh_session()
+            self._refresh_session(new_claims=True)
             return self.user
         return reply
 
